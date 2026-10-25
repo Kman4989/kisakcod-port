@@ -204,12 +204,33 @@ try{
     // SP wasm is at root, MP wasm is in mp/ subfolder
     if(path==="kisakcod-sp.wasm") return "kisakcod-sp.wasm";
     if(path==="kisakcod-mp.wasm") return "mp/kisakcod-mp.wasm";
-    // Handle pthreads worker script? It may request the .js file itself via locateFile?
-    // Fallback to original
     if(origLocate) return origLocate(path, prefix);
     return (prefix||"")+path;
   };
-  // Also ensure Module.mainScriptUrlOrBlob is not needed; workers will inherit blob URL.
+  // For embedded WASM, provide instantiateWasm hook to bypass fetch (more reliable than blob fetch)
+  if(EMBED_WASM){
+    const wasmBytesMap = {
+      "sp": () => b64ToBytes(SP_WASM_B64),
+      "mp": () => b64ToBytes(MP_WASM_B64)
+    };
+    Module.instantiateWasm = function(imports, successCallback){
+      try{
+        const bytes = wasmBytesMap[currentMode] ? wasmBytesMap[currentMode]() : null;
+        if(!bytes || !bytes.length) return undefined;
+        console.log("[kisak-single] instantiateWasm via embedded bytes", currentMode, bytes.length);
+        WebAssembly.instantiate(bytes, imports).then(function(obj){
+          successCallback(obj.instance, obj.module);
+        }).catch(function(err){
+          console.error("instantiateWasm failed", err);
+          // fallback to default
+        });
+        return {}; // tell Emscripten we handled it
+      }catch(e){
+        console.error("instantiateWasm hook error", e);
+        return undefined;
+      }
+    };
+  }
 })();
 
 // --- Fetch interceptor for embedded mods (optional) ---
@@ -228,29 +249,60 @@ function getSelectedJsUrl(){
 function startGame(){
   if(window.__kisakGameInjected) return;
   window.__kisakGameInjected = true;
-  const jsUrl = getSelectedJsUrl();
-  const url = new URL(jsUrl, location.href);
-  // Preserve original query param handling (kisakLan, bots, etc.)
-  if(Module.kisakLanUrl) url.searchParams.set("kisakLan", Module.kisakLanUrl);
-  if(Module.kisakBots){
-    url.searchParams.set("fs_game","mods/mp_bots");
-    const t=0|Module.kisakBotsAdd;
-    if(t>0) url.searchParams.set("addbots", String(t));
-  }
-  for(const k of ["devmap","ben","bench","benchcmd","benchdelay","addbots"]){
-    const v = relayParams.get(k);
-    if(v!==null) url.searchParams.set(k, v);
-  }
-  if(joinCode!==null) url.searchParams.set("joinCode", joinCode);
-  // Also set mode param for workers to know
-  url.searchParams.set("mode", currentMode);
 
+  // For kisak_launch_args to see params, ensure page URL has them (history.replaceState)
+  // This avoids needing to put ? on blob URL (blob URLs with query break).
+  try{
+    const pageUrl = new URL(location.href);
+    let changed=false;
+    function ensure(k,v){
+      if(v===null || v===undefined) return;
+      const cur=pageUrl.searchParams.get(k);
+      if(cur!==String(v)){ pageUrl.searchParams.set(k, String(v)); changed=true; }
+    }
+    if(Module.kisakLanUrl) ensure("kisakLan", Module.kisakLanUrl);
+    if(Module.kisakBots){
+      ensure("fs_game","mods/mp_bots");
+      const t=0|Module.kisakBotsAdd;
+      if(t>0) ensure("addbots", String(t));
+    }
+    for(const k of ["devmap","ben","bench","benchcmd","benchdelay","addbots"]){
+      const v = relayParams.get(k);
+      if(v!==null) ensure(k, v);
+    }
+    if(joinCode!==null) ensure("joinCode", joinCode);
+    ensure("mode", currentMode);
+    if(changed) history.replaceState(null, "", pageUrl.href);
+  }catch(e){ console.warn("history.replaceState failed", e); }
+
+  const jsUrl = getSelectedJsUrl(); // blob URL without query - critical: blob URLs with ? often fail
+  console.log("[kisak-single] loading", currentMode, "via", jsUrl.slice(0,60), "embedWasm=", EMBED_WASM);
   const s = document.createElement("script");
   s.async = true;
-  s.src = url.href;
-  // For Emscripten pthreads, workers will use this script URL; blob URL is okay.
-  s.onerror = function(e){ console.error("Failed to load game script", e); alert("Failed to load "+currentMode+" script. Check console."); };
-  // Store for debugging
+  s.src = jsUrl;
+  let fallbackDone=false;
+  s.onerror = function(e){
+    console.error("Failed to load game script via blob", e, "jsUrl:", jsUrl);
+    if(fallbackDone) return;
+    fallbackDone=true;
+    const log=document.getElementById("install-log");
+    const info="[kisak-single] blob load failed, trying inline fallback for "+currentMode;
+    console.warn(info);
+    if(log) log.textContent += "\n"+info+"\n";
+    try{
+      const b64 = currentMode==="mp" ? MP_JS_B64 : SP_JS_B64;
+      const bytes = b64ToBytes(b64);
+      const text = new TextDecoder().decode(bytes);
+      const s2=document.createElement("script");
+      s2.textContent = text;
+      document.body.appendChild(s2);
+      console.log("[kisak-single] inline fallback injected, len", text.length);
+    }catch(err){
+      console.error("inline fallback also failed", err);
+      alert("Failed to load "+currentMode+" script even after fallback. Check console. Try http server with COOP/COEP.");
+    }
+  };
+  s.onload = function(){ console.log("Loaded game script:", jsUrl, "mode:", currentMode); };
   window.__kisakCurrentGameScript = s;
   document.body.appendChild(s);
 }
